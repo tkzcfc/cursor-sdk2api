@@ -1,3 +1,4 @@
+import { SdkAgentMissingError } from "../../src/errors.js";
 import { randomUUID } from "node:crypto";
 import {
   AMBIENT_DISALLOWED_TOOLS,
@@ -44,6 +45,8 @@ export interface FakeSdkOptions {
   createErrorsByApiKey?: Record<string, { message: string; name?: string } | Array<{ message: string; name?: string }>>;
   credentialProbeByApiKey?: Record<string, "valid" | "invalid" | "unavailable">;
   resumeError?: { message: string; name?: string };
+  /** resumeAgent() throws SdkAgentMissingError (agent pruned / absent from the SDK store). */
+  resumeMissingAgent?: boolean;
   /** Invoke these custom tools synchronously inside resumeAgent(), before the Agent is returned. */
   resumeEarlyToolCalls?: Array<{ name: string; input: Record<string, unknown>; id?: string }>;
 }
@@ -370,6 +373,10 @@ export class FakeSdk implements SdkRuntime {
 
   async resumeAgent(input: ResumeAgentInput): Promise<SdkAgent> {
     if (this.options.resumeError) throw configuredError(this.options.resumeError);
+    if (this.options.resumeMissingAgent) {
+      this.resumeCalls.push(input);
+      throw new SdkAgentMissingError(input.agentId);
+    }
     this.lastResume = input;
     this.resumeCalls.push(input);
     this.lastAllowlist = apiProfileToolAllowlist(input.clientToolNames, input.hostedSearch === true);

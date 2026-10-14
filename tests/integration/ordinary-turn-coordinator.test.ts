@@ -516,6 +516,39 @@ test("process restart resumes the persisted Agent and sends only the current tur
   expect(ctx.sdk.agents[0]?.lastSend?.text).toBe("next");
 });
 
+test("restart with the parent Agent missing from the SDK store rebuilds from transcript on a fresh Agent", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-ordinary-"));
+  const firstApp = await startTestApp({
+    config: { stateDir },
+    sdk: { scripts: [[{ type: "text", chunks: ["first"] }]] },
+  });
+  const first = await api(firstApp, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  const assistant = ((await first.json()) as { content: Array<{ text?: string }> }).content[0]?.text ?? "first";
+  await closeTestApp(firstApp);
+
+  ctx = await startTestApp({
+    config: { stateDir },
+    sdk: { resumeMissingAgent: true, scripts: [[{ type: "text", chunks: ["rebuilt"] }]] },
+  });
+  const follow = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify(followBody(assistant)),
+  });
+  expect(follow.status).toBe(200);
+  expect(((await follow.json()) as { content: Array<{ text?: string }> }).content[0]?.text).toBe("rebuilt");
+  expect(ctx.sdk.resumeCalls).toHaveLength(1);
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+  expect(ctx.sdk.agents[0]?.lastSend?.text).toContain("hello");
+  expect(ctx.sdk.agents[0]?.lastSend?.text).toContain("next");
+});
+
 test("persisted ordinary resume preserves a tool callback fired inside resumeAgent", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-ordinary-"));
   const firstApp = await startTestApp({

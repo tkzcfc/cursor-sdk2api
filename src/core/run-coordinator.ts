@@ -6,6 +6,7 @@ import type { GatewayConfig } from "../config.js";
 import type { AuthContext } from "../auth/credentials.js";
 import { digestJson } from "../digest.js";
 import {
+  SdkAgentMissingError,
   GatewayError,
   forbiddenError,
   invalidRequest,
@@ -400,17 +401,29 @@ export class RunCoordinator {
         claim.parent.agentId &&
         claim.parent.credentialFingerprint === auth.fingerprint
       ) {
-        await this.resumeOrdinaryAgent(
-          req,
-          res,
-          auth,
-          parsed,
-          turn,
-          claim.parent,
-          requestId,
-          writerFactory,
-        );
-        return;
+        try {
+          await this.resumeOrdinaryAgent(
+            req,
+            res,
+            auth,
+            parsed,
+            turn,
+            claim.parent,
+            requestId,
+            writerFactory,
+          );
+          return;
+        } catch (error) {
+          // Parent agent was pruned from (or never existed in) the current SDK store:
+          // fall through to a full-transcript rebuild on a fresh agent instead of failing.
+          if (!(error instanceof SdkAgentMissingError) || res.headersSent) throw error;
+          this.deps.logger.info(
+            { agent_id: error.agentId, model: parsed.model },
+            "ordinary resume target missing from sdk store; rebuilding",
+          );
+          await this.startTurn(req, res, auth, parsed, requestId, writerFactory, turn);
+          return;
+        }
       } else {
         resume = false;
       }

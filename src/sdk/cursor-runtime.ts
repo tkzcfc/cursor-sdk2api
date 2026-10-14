@@ -1,7 +1,8 @@
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { Agent, Cursor, JsonlLocalAgentStore, type Run, type SDKAgent } from "@cursor/sdk";
+import { Agent, Cursor, type Run, type SDKAgent } from "@cursor/sdk";
+import { AgentStoreRegistry, sdkStoreBackend, storeRootName, type SdkStoreBackend } from "./agent-store.js";
 import {
   ambientDisallowedTools,
   apiProfileToolAllowlist,
@@ -18,13 +19,25 @@ import {
   type SdkStreamEvent,
   type SdkUsage,
 } from "./port.js";
-import { redactSecrets, sdkFailure } from "../errors.js";
+
+function withGrokFastDefault(
+  modelId: string,
+  params?: Array<{ id: string; value: string }>,
+): Array<{ id: string; value: string }> | undefined {
+  if (!modelId.toLowerCase().startsWith("grok")) return params;
+  const list = params ? [...params] : [];
+  if (list.some((p) => p.id === "fast")) return params;
+  list.push({ id: "fast", value: "false" });
+  return list;
+}
+
+import { redactSecrets, SdkAgentMissingError, sdkFailure } from "../errors.js";
 import { ensurePrivateDir } from "../core/lineage-store.js";
 import { DEFAULT_RUNTIME_PROFILE, type RuntimeProfile } from "../core/runtime-profile.js";
 import { credentialFingerprint } from "../digest.js";
 import { fetchCursorDashboardQuota } from "../account/cursor-dashboard.js";
 import { ensureSandSdkClone } from "./sand-loader.js";
-import { sandStoreDir, sandWorkspaceDir } from "./sand-paths.js";
+import { sandRootDir, sandWorkspaceDir } from "./sand-paths.js";
 
 const require = createRequire(import.meta.url);
 
@@ -206,19 +219,28 @@ export function agentResourceDirs(input: {
   sdkWorkspaceRoot: string;
   apiKey: string;
   profile?: RuntimeProfile;
+  backend?: SdkStoreBackend;
 }): { storeDir: string; workspaceDir: string } {
   const partition = credentialFingerprint(input.apiKey);
   const profile = input.profile ?? DEFAULT_RUNTIME_PROFILE;
+  const backend = input.backend ?? "jsonl";
   if (profile === "sand") {
+    const storeRoot = join(sandRootDir(input.stateDir), storeRootName(backend, "sand"));
+    ensurePrivateDir(storeRoot);
     return {
-      storeDir: join(sandStoreDir(input.stateDir), partition),
+      storeDir: join(storeRoot, partition),
       workspaceDir: join(sandWorkspaceDir(input.stateDir), partition),
     };
   }
   return {
-    storeDir: join(input.stateDir, "sdk-store", partition),
+    storeDir: join(input.stateDir, storeRootName(backend, "sdk"), partition),
     workspaceDir: join(input.sdkWorkspaceRoot, partition),
   };
+}
+
+/** Store roots (parents of per-credential store dirs) for a backend; used by pruning/discovery. */
+export function agentStoreRoots(stateDir: string, backend: SdkStoreBackend): string[] {
+  return [join(stateDir, storeRootName(backend, "sdk")), join(stateDir, "sand", storeRootName(backend, "sand"))];
 }
 
 type CursorAgentApi = {
@@ -239,20 +261,26 @@ async function sandAgentBindings(stateDir: string): Promise<CursorAgentApi> {
   return sandAgentApi;
 }
 
-export function createCursorRuntime(options: { stateDir: string }): SdkRuntime {
-  const sdkStoreRoot = join(options.stateDir, "sdk-store");
+export function createCursorRuntime(options: {
+  stateDir: string;
+  stores?: AgentStoreRegistry;
+}): SdkRuntime & { readonly stores: AgentStoreRegistry } {
+  const stores = options.stores ?? new AgentStoreRegistry(sdkStoreBackend());
+  const backend = stores.backend;
+  const sdkStoreRoot = join(options.stateDir, storeRootName(backend, "sdk"));
   ensurePrivateDir(sdkStoreRoot);
-  const tenantResources = (apiKey: string, workspaceRoot: string, profile?: RuntimeProfile) => {
+  const tenantResources = async (apiKey: string, workspaceRoot: string, profile?: RuntimeProfile) => {
     const dirs = agentResourceDirs({
       stateDir: options.stateDir,
       sdkWorkspaceRoot: workspaceRoot,
       apiKey,
       profile,
+      backend,
     });
     ensurePrivateDir(dirs.storeDir);
     ensurePrivateDir(dirs.workspaceDir);
     return {
-      store: new JsonlLocalAgentStore(dirs.storeDir),
+      store: await stores.get(dirs.storeDir, dirs.workspaceDir),
       workspaceDir: dirs.workspaceDir,
     };
   };
@@ -260,7 +288,19 @@ export function createCursorRuntime(options: { stateDir: string }): SdkRuntime {
     const profile = input.runtimeProfile ?? DEFAULT_RUNTIME_PROFILE;
     const hostedSearch = input.hostedSearch === true;
     const customTools = input.customTools;
-    const resources = tenantResources(input.apiKey, input.workspaceDir, profile);
+    let resources;
+    try {
+      resources = await tenantResources(input.apiKey, input.workspaceDir, profile);
+    } catch (error) {
+      throw mapSdkFailure(error);
+    }
+    const resumeId = kind === "resume" && "agentId" in input ? input.agentId : undefined;
+    if (resumeId !== undefined && !resumeId.startsWith("bc-")) {
+      // Sessions can outlive their SDK agent (idle pruning, or an agent created under the
+      // other store backend). Surface a typed error so callers can rebuild from transcript.
+      const doc = await resources.store.agents.get({ agentId: resumeId }).catch(() => undefined);
+      if (doc === null) throw new SdkAgentMissingError(resumeId);
+    }
     const api = profile === "sand" ? await sandAgentBindings(options.stateDir) : { create: Agent.create, resume: Agent.resume };
     const local = {
       cwd: resources.workspaceDir,
@@ -272,7 +312,7 @@ export function createCursorRuntime(options: { stateDir: string }): SdkRuntime {
       apiKey: input.apiKey,
       model: {
         id: input.modelId,
-        params: input.modelParams,
+        params: withGrokFastDefault(input.modelId, input.modelParams),
       },
       tools: apiProfileToolAllowlist(input.clientToolNames, hostedSearch) as never,
       disallowedTools: ambientDisallowedTools(hostedSearch) as never,
@@ -284,11 +324,15 @@ export function createCursorRuntime(options: { stateDir: string }): SdkRuntime {
         ? await api.resume(input.agentId, shared)
         : await api.create(shared);
     } catch (error) {
+      if (resumeId !== undefined && error instanceof Error && /^Agent \S+ not found$/.test(error.message)) {
+        throw new SdkAgentMissingError(resumeId);
+      }
       throw mapSdkFailure(error);
     }
     return wrapSdkAgent(agent, customTools);
   };
   return {
+    stores,
     sdkVersion: readSdkVersion(),
     createAgent(input: CreateAgentInput): Promise<SdkAgent> {
       return bindAgent(input, "create");

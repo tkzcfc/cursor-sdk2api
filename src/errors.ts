@@ -51,6 +51,16 @@ export function sessionLost(message: string): GatewayError {
   return new GatewayError("cursor_session_lost", message, 409);
 }
 
+/** The SDK agent a session points at is no longer in the local store (pruned, or created under another store backend). */
+export class SdkAgentMissingError extends GatewayError {
+  readonly agentId: string;
+  constructor(agentId: string) {
+    super("cursor_session_lost", `Cursor SDK agent ${agentId} is no longer in the local agent store`, 409);
+    this.name = "SdkAgentMissingError";
+    this.agentId = agentId;
+  }
+}
+
 export function rateLimited(message: string): GatewayError {
   return new GatewayError("rate_limited", message, 429);
 }

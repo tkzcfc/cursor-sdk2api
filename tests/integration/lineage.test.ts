@@ -5,6 +5,7 @@ import { afterEach, expect, test } from "vitest";
 import { FakeClock } from "../../src/clock.js";
 import { LineageStore } from "../../src/core/lineage-store.js";
 import { createCursorRuntime } from "../../src/sdk/cursor-runtime.js";
+import { AgentStoreRegistry, sdkStoreBackend } from "../../src/sdk/agent-store.js";
 import { api, closeTestApp, startTestApp, weatherTool, type TestContext } from "../helpers/app.js";
 
 const apps: TestContext[] = [];
@@ -362,9 +363,17 @@ test("lineage expiry blocks follow-up after TTL", async () => {
   expect(app2.sdk.resumeCalls).toHaveLength(0);
 });
 
-test("createCursorRuntime opens JsonlLocalAgentStore under STATE_DIR", () => {
+test("createCursorRuntime opens the SQLite agent store root under STATE_DIR by default", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-sdk-store-"));
   const runtime = createCursorRuntime({ stateDir });
   expect(runtime.sdkVersion).toBe("1.0.30");
+  expect(runtime.stores.backend).toBe("sqlite");
+  expect(existsSync(join(stateDir, "sdk-store-sqlite"))).toBe(true);
+});
+
+test("createCursorRuntime keeps the JsonlLocalAgentStore root when SDK_STORE_BACKEND=jsonl", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-sdk-store-"));
+  const runtime = createCursorRuntime({ stateDir, stores: new AgentStoreRegistry(sdkStoreBackend({ SDK_STORE_BACKEND: "jsonl" })) });
+  expect(runtime.stores.backend).toBe("jsonl");
   expect(existsSync(join(stateDir, "sdk-store"))).toBe(true);
 });
