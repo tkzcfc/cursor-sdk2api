@@ -22,6 +22,7 @@ services:
       # HTTPS_PROXY: http://host.docker.internal:7890
       # HTTP_PROXY: http://host.docker.internal:7890
       # NO_PROXY: 127.0.0.1,localhost
+      RUN_DEADLINE_MS: ${RUN_DEADLINE_MS:-14400000}
     volumes:
       - cursor-sdk2api-data:/data
     # Supply keys at run time. Do not put real secrets in this file.
